@@ -14,6 +14,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#define UNDO_STACK_SIZE 100
+
 #define CTRL_KEY(x) ((x) & 0x1f)
 #define KILO_VERSION "0.0.1"
 #define KILO_TAB_STOP 3
@@ -28,6 +30,18 @@ typedef struct erow {
   unsigned char *hl;
   int hl_open_comment;
 } erow;
+
+typedef struct {
+  int numrows;
+  erow *row;
+  int cx, cy;
+} editorState;
+
+editorState undo_stack[UNDO_STACK_SIZE];
+int undo_index = 0;
+
+editorState redo_stack[UNDO_STACK_SIZE];
+int redo_index = 0;
 
 enum editorKey {
   BACKSPACE = 127,
@@ -83,7 +97,9 @@ struct editorConfig {
   time_t statusmsg_time;
   struct editorSyntax *syntax;
   struct termios orig_termios;
+  int last_key_edit;
 };
+
 
 /** filetype **/
 char *C_HL_extensions[] = {".c", ".h", ".cpp", NULL};
@@ -121,7 +137,69 @@ void die(const char *s) {
   exit(1);
 }
 
+void freeEditorState(editorState *state) {
+  if (!state->row) return;
+  for (int j = 0; j < state->numrows; j++) {
+    free(state->row[j].chars);
+    free(state->row[j].render);
+    free(state->row[j].hl);
+  }
+  free(state->row);
+  state->row = NULL;
+}
 
+erow copyErow(erow* src) {
+  erow r;
+  r.idx = src->idx;
+  r.size = src->size;
+  r.rsize = src->rsize;
+  r.hl_open_comment = src->hl_open_comment;
+  r.chars = strdup(src->chars);
+  r.render = strdup(src->render);
+  r.hl = malloc(src->size);
+  memcpy(r.hl, src->hl, r.rsize);
+  return r;
+}
+
+void copyEditorState(editorState *dest) {
+  dest->numrows = E.numrows;
+  dest->row = malloc(sizeof(erow) * E.numrows);
+  for (int i = 0; i < E.numrows; i++) {
+    dest->row[i] = copyErow(&E.row[i]);
+  }
+  dest->cx = E.cx;
+  dest->cy = E.cy;
+}
+
+void restoreEditorState(editorState *src) {
+  for (int i = 0; i < E.numrows; i++) {
+    free(E.row[i].chars);
+    free(E.row[i].render);
+    free(E.row[i].hl);
+  }
+  free(E.row);
+
+  E.numrows = src->numrows;
+  E.row = malloc((sizeof(erow) * E.numrows));
+  for (int j = 0; j < E.numrows; j++) {
+    E.row[j] = copyErow(&src->row[j]);
+  }
+  E.cx = src->cx;
+  E.cy = src->cy;
+  E.dirty += 1;
+}
+
+void saveUndoState() {
+  if (undo_index >= UNDO_STACK_SIZE) undo_index = 0;
+  freeEditorState(&undo_stack[undo_index]);
+  copyEditorState(&undo_stack[undo_index]);
+  undo_index++;
+
+  for (int i = 0; i < redo_index; i++) {
+    freeEditorState(&redo_stack[i]);
+  }
+  redo_index = 0;
+}
 
 void disableRawMode() {
   if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &E.orig_termios) == -1)
@@ -517,6 +595,7 @@ void editorInsertChar(int c) {
 
 
 void editorInsertNewline() {
+  saveUndoState();
   if (E.cx == 0) {
     editorInsertRow(E.cy, "", 0);
   } else {
@@ -799,6 +878,10 @@ void editorProcessKeypress() {
   int c = editorReadKey();
   switch (c) {
     case '\r':
+      if (!E.last_key_edit) {
+        saveUndoState();
+        E.last_key_edit = 1;
+      }
       editorInsertNewline();
       break;
 
@@ -811,6 +894,28 @@ void editorProcessKeypress() {
       write(STDOUT_FILENO, "\x1b[2J", 4);
       write(STDOUT_FILENO, "\x1b[H", 3);
       exit(0);
+      break;
+
+    case CTRL_KEY('z'):
+      if (undo_index > 0) {
+        redo_index++;
+        freeEditorState(&redo_stack[redo_index-1]);
+        copyEditorState(&redo_stack[redo_index-1]);
+
+        undo_index--;
+        restoreEditorState(&undo_stack[undo_index]);
+      }
+      break;
+
+    case CTRL_KEY('r'):
+      if (redo_index > 0) {
+        redo_index--;
+        restoreEditorState(&redo_stack[redo_index]);
+
+        undo_index++;
+        freeEditorState(&undo_stack[undo_index-1]);
+        copyEditorState(&undo_stack[undo_index-1]);
+      }
       break;
 
     case CTRL_KEY('s'):
@@ -834,6 +939,10 @@ void editorProcessKeypress() {
     case BACKSPACE:
     case CTRL_KEY('h'):
     case DELETE_KEY:
+      if (!E.last_key_edit) {
+        saveUndoState();
+        E.last_key_edit = 1;
+      }
       if (c == DELETE_KEY) editorMoveCursor(ARROW_RIGHT);
       editorDelChar();
       break;
@@ -867,10 +976,34 @@ void editorProcessKeypress() {
     case '\x1b':
 
     default:
-        editorInsertChar(c);
+      if (!iscntrl(c)) {
+        if (!E.last_key_edit) {
+          saveUndoState();
+          E.last_key_edit = 1;
+        }
+      }
+      editorInsertChar(c);
+      break;
   }
 
-  quit_times = KILO_QUIT_TIMES;
+  if (c != CTRL_KEY('q')) {
+    quit_times = KILO_QUIT_TIMES;
+  }
+
+  switch(c) {
+    case ARROW_LEFT: case ARROW_RIGHT:
+    case ARROW_UP: case ARROW_DOWN:
+    case PAGE_UP: case PAGE_DOWN:
+    case HOME_KEY: case END_KEY:
+    case CTRL_KEY('s'): case CTRL_KEY('f'):
+    case CTRL_KEY('z'): case CTRL_KEY('r'):
+    case CTRL_KEY('l'): case ' ':
+    case '\x1b':
+      E.last_key_edit = 0;
+      break;
+  }
+
+
 }
 
 void editorScroll() {
