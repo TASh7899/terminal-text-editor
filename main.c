@@ -939,10 +939,7 @@ void editorProcessKeypress() {
     case BACKSPACE:
     case CTRL_KEY('h'):
     case DELETE_KEY:
-      if (!E.last_key_edit) {
         saveUndoState();
-        E.last_key_edit = 1;
-      }
       if (c == DELETE_KEY) editorMoveCursor(ARROW_RIGHT);
       editorDelChar();
       break;
@@ -999,10 +996,11 @@ void editorProcessKeypress() {
     case CTRL_KEY('z'): case CTRL_KEY('r'):
     case CTRL_KEY('l'): case ' ':
     case '\x1b':
+    case BACKSPACE: case CTRL_KEY('h'): case DELETE_KEY:
       E.last_key_edit = 0;
       break;
-  }
 
+  }
 
 }
 
