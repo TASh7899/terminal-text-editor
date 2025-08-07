@@ -146,6 +146,7 @@ void freeEditorState(editorState *state) {
   }
   free(state->row);
   state->row = NULL;
+  state->numrows = 0;
 }
 
 erow copyErow(erow* src) {
@@ -156,7 +157,7 @@ erow copyErow(erow* src) {
   r.hl_open_comment = src->hl_open_comment;
   r.chars = strdup(src->chars);
   r.render = strdup(src->render);
-  r.hl = malloc(src->size);
+  r.hl = malloc(src->rsize);
   memcpy(r.hl, src->hl, r.rsize);
   return r;
 }
@@ -171,13 +172,20 @@ void copyEditorState(editorState *dest) {
   dest->cy = E.cy;
 }
 
-void restoreEditorState(editorState *src) {
-  for (int i = 0; i < E.numrows; i++) {
-    free(E.row[i].chars);
-    free(E.row[i].render);
-    free(E.row[i].hl);
+void freeEditorConfig(struct editorConfig *cfg) {
+  if (!cfg->row) return;
+  for (int j = 0; j < cfg->numrows; j++) {
+    free(cfg->row[j].chars);
+    free(cfg->row[j].render);
+    free(cfg->row[j].hl);
   }
-  free(E.row);
+  free(cfg->row);
+  cfg->row = NULL;
+  cfg->numrows = 0;
+}
+
+void restoreEditorState(editorState *src) {
+  freeEditorConfig(&E);
 
   E.numrows = src->numrows;
   E.row = malloc((sizeof(erow) * E.numrows));
@@ -190,15 +198,17 @@ void restoreEditorState(editorState *src) {
 }
 
 void saveUndoState() {
-  if (undo_index >= UNDO_STACK_SIZE) undo_index = 0;
-  freeEditorState(&undo_stack[undo_index]);
-  copyEditorState(&undo_stack[undo_index]);
-  undo_index++;
+  if (undo_index == UNDO_STACK_SIZE) {
+    freeEditorState(&undo_stack[0]);
+    memmove(&undo_stack[0], &undo_stack[1], sizeof(editorState) * (UNDO_STACK_SIZE - 1));
+    undo_index--;
+  }
 
   for (int i = 0; i < redo_index; i++) {
     freeEditorState(&redo_stack[i]);
   }
   redo_index = 0;
+  copyEditorState(&undo_stack[undo_index++]);
 }
 
 void disableRawMode() {
@@ -872,6 +882,11 @@ void editorMoveCursor(int key) {
   }
 }
 
+void clearUndoRedo(void) {
+  for (int i = 0; i < undo_index; i++) freeEditorState(&undo_stack[i]);
+  for (int i = 0; i < redo_index; i++) freeEditorState(&redo_stack[i]);
+}
+
 void editorProcessKeypress() {
   static int quit_times = KILO_QUIT_TIMES;
 
@@ -886,6 +901,7 @@ void editorProcessKeypress() {
       break;
 
     case CTRL_KEY('q'):
+      clearUndoRedo();
       if (E.dirty && quit_times > 0) {
         editorSetStatusMessage("WARNING!!! unsaved changes / press Ctrl-Q %d times to force quit", quit_times);
         quit_times--;
@@ -898,10 +914,7 @@ void editorProcessKeypress() {
 
     case CTRL_KEY('z'):
       if (undo_index > 0) {
-        redo_index++;
-        freeEditorState(&redo_stack[redo_index-1]);
-        copyEditorState(&redo_stack[redo_index-1]);
-
+        copyEditorState(&redo_stack[redo_index++]);
         undo_index--;
         restoreEditorState(&undo_stack[undo_index]);
       }
@@ -909,12 +922,10 @@ void editorProcessKeypress() {
 
     case CTRL_KEY('r'):
       if (redo_index > 0) {
+        copyEditorState(&undo_stack[undo_index++]);
+
         redo_index--;
         restoreEditorState(&redo_stack[redo_index]);
-
-        undo_index++;
-        freeEditorState(&undo_stack[undo_index-1]);
-        copyEditorState(&undo_stack[undo_index-1]);
       }
       break;
 
@@ -1167,7 +1178,16 @@ void initEditor() {
   E.screenrows -= 2;
 }
 
+void initUndoRedo(void) {
+  undo_index = redo_index = 0;
+  memset(undo_stack, 0, sizeof(undo_stack));
+  memset(redo_stack, 0, sizeof(redo_stack));
+}
+
+
+
 int main(int argc, char *argv[]) {
+  initUndoRedo();
   enableRawMode();
   initEditor();
   if (argc >= 2) {
